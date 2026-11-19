@@ -7,7 +7,7 @@ Zeile und legt jeden neuen Stand als verschlüsselte Datei ab. Alle Adressen, Fe
 Zugangsdaten kommen aus der Umgebung; in diesem Skript steht nichts davon.
 
 Aufruf:
-  python3 sammler.py           stündlicher Lauf (wartet bis zu warte_min Minuten auf neue Stände)
+  python3 sammler.py           stündlicher Lauf (holt neue Stände und wartet auf den nächsten, wenn er bald kommt)
   python3 sammler.py woche     Wochenlauf: Wörterbuch zusammenfassen, Wochenarchiv, Ringpuffer
 
 Umgebung:
@@ -36,7 +36,7 @@ from email.utils import parsedate_to_datetime
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 KENNUNG = b"FMD1"
 SPALTEN = ["item", "variante", "min", "markt", "s100", "s1000", "menge", "angebote", "neu", "neu_menge", "kurz"]
 STAFFEL = ["s10000", "st5", "st10", "st25"]
@@ -410,7 +410,17 @@ def lade_konfig():
         raise SystemExit("FM_KONFIG fehlt oder ist kein gültiges JSON.")
 
 
+def stand_von(z):
+    try:
+        return dt.datetime.strptime(z["stand"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return None
+
+
 def lauf():
+    """Holt sofort alle neuen Stände. Kommt der nächste Stand innerhalb von vorlauf_min Minuten,
+    wartet der Lauf auch auf ihn. So entstehen keine Lücken, auch wenn GitHub die Läufe
+    unregelmäßig und nur etwa stündlich startet."""
     kennung, geheim = os.environ.get("FM_ID", "").strip(), os.environ.get("FM_GEHEIM", "").strip()
     if not kennung or not geheim:
         raise SystemExit("FM_ID oder FM_GEHEIM fehlt.")
@@ -419,71 +429,93 @@ def lauf():
     standdatei = os.path.join(VORDNER, "stand.json")
     try:
         with open(standdatei, encoding="utf-8") as f:
-            alt_text = f.read()
-        stand = json.loads(alt_text)
+            stand = json.loads(f.read())
     except Exception:
-        alt_text, stand = "", {}
-    jetzt = utc_jetzt()
-    frisch = float(konfig.get("frisch_min", 55))
-
-    def ist_frisch(z):
-        try:
-            t = dt.datetime.strptime(z["stand"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-            return (jetzt - t).total_seconds() < frisch * 60
-        except Exception:
-            return False
-
-    offen = {q["k"]: q for q in konfig["quellen"] if not ist_frisch(stand.get(q["k"]) or {})}
-    if not offen:
-        sag(f"Nichts fällig: alle {len(konfig['quellen'])} Quellen haben einen Stand jünger als {frisch:.0f} Minuten.")
-        return 0
-    sag(f"{len(offen)} von {len(konfig['quellen'])} Quellen fällig.")
+        stand = {}
+    takt = float(konfig.get("takt_s", 120))
+    intervall = dt.timedelta(minutes=float(konfig.get("intervall_min", 60)))
+    vorlauf = dt.timedelta(minutes=float(konfig.get("vorlauf_min", 50)))
+    nachlauf = dt.timedelta(minutes=float(konfig.get("nachlauf_min", 15)))
+    hart = time.time() + float(konfig.get("max_min", 70)) * 60
     kopf = {"Authorization": "Bearer " + hole_token(konfig, kennung, geheim)}
     wb = Woerterbuch(VORDNER, schluessel)
-    ende = time.time() + float(konfig.get("warte_min", 40)) * 60
-    takt = float(konfig.get("takt_s", 120))
-    stoerungen, fehler, neu, runde = {}, 0, 0, 0
-    while offen:
-        runde += 1
-        for k, q in list(offen.items()):
+    quellen = {q["k"]: q for q in konfig["quellen"]}
+    gesperrt, stoerungen = set(), {}
+    zaehler = {"neu": 0, "fehler": 0}
+
+    def runde(auswahl):
+        neu = 0
+        for k in auswahl:
+            if k in gesperrt:
+                continue
             try:
-                ergebnis, info, zustand = eine_quelle(q, konfig, kopf, stand.get(k) or {}, wb, schluessel, jetzt)
+                ergebnis, info, zustand = eine_quelle(quellen[k], konfig, kopf, stand.get(k) or {}, wb, schluessel, utc_jetzt())
             except FormFehler as e:
-                fehler += 1
+                zaehler["fehler"] += 1
+                gesperrt.add(k)
                 sag(f"Quelle {k}: FEHLER - {e}")
-                del offen[k]
                 continue
             except Exception as e:                               # nichts Unerwartetes darf Zugangsdaten ins Protokoll bringen
-                fehler += 1
+                zaehler["fehler"] += 1
+                gesperrt.add(k)
                 sag(f"Quelle {k}: FEHLER - {type(e).__name__}")
-                del offen[k]
                 continue
             if ergebnis == "neu":
                 neu += 1
                 stand[k] = zustand
                 sag(f"Quelle {k}: {info}")
-                del offen[k]
             elif ergebnis == "stoerung":
                 stoerungen[k] = stoerungen.get(k, 0) + 1
                 if stoerungen[k] >= 3:
-                    fehler += 1
+                    zaehler["fehler"] += 1
+                    gesperrt.add(k)
                     sag(f"Quelle {k}: FEHLER - dreimal gestört ({info})")
-                    del offen[k]
-        if not offen or time.time() + takt > ende:
-            break
-        if runde == 1:
-            sag(f"Warte auf {len(offen)} Quellen (Nachfrage alle {takt:.0f} s) ...")
-        time.sleep(takt)
-    for k in offen:
-        sag(f"Quelle {k}: kein neuer Stand in diesem Lauf")
-    neue_varianten = wb.speichere_nachtrag(utc_jetzt())
-    neu_text = json.dumps(stand, indent=1, sort_keys=True)
-    if neu_text != alt_text:
+        if neu:
+            zaehler["neu"] += neu
+            sichern()
+        return neu
+
+    def sichern():                                               # nach jeder Runde mit neuen Ständen, falls der Lauf abbricht
+        wb.speichere_nachtrag(utc_jetzt())
         os.makedirs(VORDNER, exist_ok=True)
-        with open(standdatei, "w", encoding="utf-8") as f:
-            f.write(neu_text)
-    sag(f"Fertig: {neu} neue Stände, {len(offen)} ohne neuen Stand, {fehler} Fehler, {neue_varianten} neue Varianten (gesamt {wb.anzahl()}).")
-    return 1 if fehler else 0
+        with open(standdatei + ".teil", "w", encoding="utf-8") as f:
+            f.write(json.dumps(stand, indent=1, sort_keys=True))
+        os.replace(standdatei + ".teil", standdatei)
+
+    # 1. sofort: alles holen, was gerade neu ist
+    n = runde(list(quellen))
+    sag(f"Sofort: {n} neue Stände von {len(quellen)} Quellen.")
+
+    # 2. nächsten Stand abwarten, wenn er bald kommt
+    zeiten = [t for t in (stand_von(stand.get(k) or {}) for k in quellen) if t]
+    if zeiten:
+        jetzt = utc_jetzt()
+        ziel = max(zeiten) + intervall
+        while ziel < jetzt - nachlauf:                           # Quelle hat Stände ausgelassen
+            ziel += intervall
+        if ziel - jetzt > vorlauf:
+            sag(f"Nächster Stand gegen {ziel.strftime('%H:%M')} UTC, in {(ziel - jetzt).total_seconds() / 60:.0f} Minuten - das übernimmt der nächste Lauf.")
+        else:
+            warte = (ziel - jetzt).total_seconds() - 60
+            sag(f"Warte auf den Stand gegen {ziel.strftime('%H:%M')} UTC (Nachfrage alle {takt:.0f} s) ...")
+            if warte > 0:
+                time.sleep(min(warte, max(0, hart - time.time())))
+            schwelle = ziel - intervall / 2
+            while True:
+                offen = [k for k in quellen if k not in gesperrt and not ((stand_von(stand.get(k) or {}) or ziel - intervall) >= schwelle)]
+                if not offen:
+                    break
+                runde(offen)
+                offen = [k for k in quellen if k not in gesperrt and not ((stand_von(stand.get(k) or {}) or ziel - intervall) >= schwelle)]
+                if not offen or utc_jetzt() > ziel + nachlauf or time.time() + takt > hart:
+                    for k in offen:
+                        sag(f"Quelle {k}: Stand gegen {ziel.strftime('%H:%M')} UTC kam nicht in diesem Lauf")
+                    break
+                time.sleep(takt)
+    if wb.neu:
+        sichern()
+    sag(f"Fertig: {zaehler['neu']} neue Stände, {zaehler['fehler']} Fehler, Varianten gesamt {wb.anzahl()}.")
+    return 1 if zaehler["fehler"] else 0
 
 
 # ---------------------------------------------------------------- Wochenlauf
