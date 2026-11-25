@@ -1,0 +1,62 @@
+name: lauf
+
+on:
+  schedule:
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lauf
+  cancel-in-progress: false
+
+jobs:
+  lauf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: holen
+        run: |
+          git clone -q --depth 1 --filter=blob:none --no-checkout "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" .
+          git sparse-checkout set v
+          git checkout -q
+
+      - name: vorbereiten
+        run: |
+          if python3 -c "import cryptography" 2>/dev/null; then
+            echo "PY=python3" >> "$GITHUB_ENV"
+          elif python3 -m venv .v 2>/dev/null && .v/bin/pip install -q cryptography; then
+            echo "PY=.v/bin/python" >> "$GITHUB_ENV"
+          else
+            pip install -q --user --break-system-packages cryptography
+            echo "PY=python3" >> "$GITHUB_ENV"
+          fi
+
+      - name: abrufen
+        env:
+          FM_ID: ${{ secrets.FM_ID }}
+          FM_GEHEIM: ${{ secrets.FM_GEHEIM }}
+          FM_SCHLUESSEL: ${{ secrets.FM_SCHLUESSEL }}
+          FM_KONFIG: ${{ secrets.FM_KONFIG }}
+        run: $PY sammler.py
+
+      - name: ablegen
+        if: always()
+        run: |
+          [ -d d ] || [ -d v ] || exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --sparse d v 2>/dev/null || git add --sparse v
+          if git diff --cached --quiet; then echo "nichts Neues"; exit 0; fi
+          git commit -q -m "stand"
+          for i in 1 2 3; do
+            if git push -q; then exit 0; fi
+            sleep $((i * 5))
+            git pull -q --rebase || true
+          done
+          exit 1

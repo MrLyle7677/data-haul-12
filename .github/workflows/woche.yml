@@ -1,0 +1,41 @@
+name: woche
+
+on:
+  schedule:
+    - cron: "41 3 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lauf
+  cancel-in-progress: false
+
+jobs:
+  woche:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: holen
+        run: git clone -q --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" .
+
+      - name: vorbereiten
+        run: |
+          if python3 -c "import cryptography" 2>/dev/null; then
+            echo "PY=python3" >> "$GITHUB_ENV"
+          elif python3 -m venv /tmp/v 2>/dev/null && /tmp/v/bin/pip install -q cryptography; then
+            echo "PY=/tmp/v/bin/python" >> "$GITHUB_ENV"
+          else
+            pip install -q --user --break-system-packages cryptography
+            echo "PY=python3" >> "$GITHUB_ENV"
+          fi
+
+      - name: aufraeumen
+        env:
+          FM_SCHLUESSEL: ${{ secrets.FM_SCHLUESSEL }}
+          FM_KONFIG: ${{ secrets.FM_KONFIG }}
+        run: $PY sammler.py woche
